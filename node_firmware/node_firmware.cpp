@@ -12,12 +12,18 @@
 
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
+#if BOSON_USB_HID_HOST
 #include "tusb.h"
+#endif
 
 #include "lwip/tcp.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/err.h"
 #include "lwip/netif.h"
+
+#ifndef BOSON_USB_HID_HOST
+#define BOSON_USB_HID_HOST 1
+#endif
 
 // ============================================================
 // 1. USER CONFIGURATION
@@ -41,6 +47,9 @@ const unsigned long SERVER_CONNECT_TIMEOUT_MS = 5000;
 const unsigned long ACK_TIMEOUT_MS = 3000;
 const uint8_t MAX_SEND_RETRIES = 3;
 const unsigned long STATUS_PRINT_INTERVAL_MS = 10000;
+
+// Ignore brief link / status glitches before clearing Wi-Fi (USB host + SDIO).
+const unsigned long WIFI_LINK_LOST_CONFIRM_MS = 4000;
 
 const size_t BARCODE_ID_MAX = 200;
 const size_t SERIAL_LINE_MAX = 200;
@@ -72,6 +81,7 @@ static bool engineConnected = false;
 
 static unsigned long lastWiFiAttempt = 0;
 static unsigned long lastStatusPrint = 0;
+static unsigned long wifi_unstable_since_ms = 0;
 
 static uint32_t packetsSent = 0;
 static uint32_t packetsAcked = 0;
@@ -102,7 +112,9 @@ static char ackLineStorage[64];
 static char hidBarcode[SERIAL_LINE_MAX + 1];
 static uint16_t hidBarcodeLen = 0;
 static bool hidBarcodeOverflow = false;
+#if BOSON_USB_HID_HOST
 static hid_keyboard_report_t hidPreviousReport = {};
+#endif
 static volatile bool scannerDetected = false;
 static volatile bool fatal_error = false;
 
@@ -178,10 +190,38 @@ static void trim_whitespace(char* s)
   }
 }
 
-static bool wifi_is_up()
+static int wifi_link_status_raw()
 {
-  int status = cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA);
-  return status == CYW43_LINK_UP;
+  return cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA);
+}
+
+static bool wifi_has_ipv4()
+{
+  bool has_ip = false;
+
+  cyw43_arch_lwip_begin();
+  struct netif* n = &cyw43_state.netif[CYW43_ITF_STA];
+  has_ip = !ip4_addr_isany(netif_ip4_addr(n));
+  cyw43_arch_lwip_end();
+
+  return has_ip;
+}
+
+static bool wifi_link_usable()
+{
+  const int status = wifi_link_status_raw();
+
+  if (status == CYW43_LINK_FAIL || status == CYW43_LINK_DOWN)
+  {
+    return false;
+  }
+
+  if (status >= CYW43_LINK_JOIN)
+  {
+    return wifi_has_ipv4();
+  }
+
+  return false;
 }
 
 static void led_write(bool on)
@@ -676,12 +716,59 @@ static void runStartupDiagnostics()
 // 9. WI-FI MANAGEMENT
 // ============================================================
 
+static void wifi_print_status_line()
+{
+  cyw43_arch_lwip_begin();
+  struct netif* n = &cyw43_state.netif[CYW43_ITF_STA];
+  printf("IP ADDRESS      : %s\n", ip4addr_ntoa(netif_ip4_addr(n)));
+  printf("GATEWAY         : %s\n", ip4addr_ntoa(netif_ip4_gw(n)));
+  cyw43_arch_lwip_end();
+
+  int32_t rssi = 0;
+  cyw43_wifi_get_rssi(&cyw43_state, &rssi);
+  printf("RSSI            : %ld dBm\n", (long)rssi);
+}
+
 static bool connectWiFi()
 {
-  if (wifi_is_up())
+  if (wifi_link_usable())
   {
     wifiConnected = true;
+    wifi_unstable_since_ms = 0;
     return true;
+  }
+
+  const int status = wifi_link_status_raw();
+
+  // Associated but DHCP still running — wait without tearing down the link.
+  if (status >= CYW43_LINK_JOIN && !wifi_has_ipv4())
+  {
+    printf("[NETWORK] Waiting for DHCP...\n");
+
+    unsigned long start = millis();
+    while (!wifi_has_ipv4() && millis() - start < WIFI_CONNECT_TIMEOUT_MS)
+    {
+#if BOSON_USB_HID_HOST
+      tuh_task();
+#endif
+      update_status_led();
+      delay_ms(250);
+    }
+
+    if (wifi_has_ipv4())
+    {
+      wifiConnected = true;
+      wifi_unstable_since_ms = 0;
+      printf("[OK] Wi-Fi connected\n");
+      wifi_print_status_line();
+      return true;
+    }
+  }
+
+  if (status != CYW43_LINK_DOWN && status != CYW43_LINK_FAIL)
+  {
+    printf("[WARN] Wi-Fi not ready (status=%d)\n", status);
+    return false;
   }
 
   printf("Connecting to Wi-Fi: %s\n", WIFI_SSID);
@@ -695,9 +782,11 @@ static bool connectWiFi()
     WIFI_CONNECT_TIMEOUT_MS
   );
 
-  while (!wifi_is_up() && millis() - start < WIFI_CONNECT_TIMEOUT_MS)
+  while (!wifi_link_usable() && millis() - start < WIFI_CONNECT_TIMEOUT_MS)
   {
+#if BOSON_USB_HID_HOST
     tuh_task();
+#endif
     update_status_led();
     delay_ms(250);
     printf(".");
@@ -705,19 +794,13 @@ static bool connectWiFi()
 
   printf("\n");
 
-  if (result == 0 && wifi_is_up())
+  if (result == 0 && wifi_link_usable())
   {
     wifiConnected = true;
+    wifi_unstable_since_ms = 0;
 
     printf("[OK] Wi-Fi connected\n");
-
-    struct netif* n = &cyw43_state.netif[CYW43_ITF_STA];
-    printf("IP ADDRESS      : %s\n", ip4addr_ntoa(netif_ip4_addr(n)));
-    printf("GATEWAY         : %s\n", ip4addr_ntoa(netif_ip4_gw(n)));
-
-    int32_t rssi = 0;
-    cyw43_wifi_get_rssi(&cyw43_state, &rssi);
-    printf("RSSI            : %ld dBm\n", (long)rssi);
+    wifi_print_status_line();
 
     return true;
   }
@@ -729,24 +812,34 @@ static bool connectWiFi()
 
 static bool ensureWiFi()
 {
-  if (wifi_is_up())
+  if (wifi_link_usable())
   {
+    wifi_unstable_since_ms = 0;
+
     if (!wifiConnected)
     {
       wifiConnected = true;
       printf("\n[OK] Wi-Fi reconnected\n");
-
-      struct netif* n = &cyw43_state.netif[CYW43_ITF_STA];
-      printf("IP ADDRESS      : %s\n", ip4addr_ntoa(netif_ip4_addr(n)));
-
-      int32_t rssi = 0;
-      cyw43_wifi_get_rssi(&cyw43_state, &rssi);
-      printf("RSSI            : %ld dBm\n", (long)rssi);
+      wifi_print_status_line();
     }
 
     return true;
   }
 
+  if (wifiConnected)
+  {
+    if (wifi_unstable_since_ms == 0)
+    {
+      wifi_unstable_since_ms = millis();
+    }
+
+    if (millis() - wifi_unstable_since_ms < WIFI_LINK_LOST_CONFIRM_MS)
+    {
+      return true;
+    }
+  }
+
+  wifi_unstable_since_ms = 0;
   wifiConnected = false;
 
   if (engineConnected)
@@ -830,7 +923,9 @@ static bool connectToEngine()
   unsigned long start = millis();
   while (!engine_client_connected() && millis() - start < SERVER_CONNECT_TIMEOUT_MS)
   {
+#if BOSON_USB_HID_HOST
     tuh_task();
+#endif
     update_status_led();
     delay_ms(10);
   }
@@ -1292,7 +1387,9 @@ static bool waitForAck(uint32_t expectedSequence)
       return false;
     }
 
+#if BOSON_USB_HID_HOST
     tuh_task();
+#endif
     update_status_led();
     delay_ms(2);
   }
@@ -1310,11 +1407,15 @@ static void printStatus()
   printf("DEVICE          : %s\n", DEVICE_ID);
   printf("WIFI            : ");
 
-  if (wifiConnected)
+  if (wifiConnected && wifi_link_usable())
   {
     int32_t rssi = 0;
     cyw43_wifi_get_rssi(&cyw43_state, &rssi);
     printf("CONNECTED | RSSI %ld dBm\n", (long)rssi);
+  }
+  else if (wifiConnected)
+  {
+    printf("STABILIZING (debounce)\n");
   }
   else
   {
@@ -1334,6 +1435,8 @@ static void printStatus()
 // ============================================================
 // USB HOST + HID (from barcodescannertest)
 // ============================================================
+
+#if BOSON_USB_HID_HOST
 
 static char keycode_to_ascii(uint8_t keycode, bool shift)
 {
@@ -1438,6 +1541,7 @@ static void finishHidBarcode()
 
 static void initUsbHost()
 {
+#if BOSON_USB_HID_HOST
   const tusb_rhport_init_t usb_init = {
     .role = TUSB_ROLE_HOST,
     .speed = TUSB_SPEED_FULL
@@ -1453,6 +1557,14 @@ static void initUsbHost()
       sleep_ms(1);
     }
   }
+
+  printf("[USB] HID host active on micro USB (OTG scanner).\n");
+#else
+  printf(
+    "[USB] HID host disabled (BOSON_USB_HID_HOST=0). "
+    "Use USB serial monitor on micro USB.\n"
+  );
+#endif
 }
 
 extern "C" void tuh_hid_mount_cb(
@@ -1538,6 +1650,8 @@ extern "C" void tuh_hid_report_received_cb(
   tuh_hid_receive_report(dev_addr, instance);
 }
 
+#endif // BOSON_USB_HID_HOST
+
 // ============================================================
 // MAIN
 // ============================================================
@@ -1565,7 +1679,9 @@ int main()
 
   while (true)
   {
+#if BOSON_USB_HID_HOST
     tuh_task();
+#endif
     loop();
   }
 }

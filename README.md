@@ -34,11 +34,26 @@ cmake --build .
 
 Output: `node_firmware.uf2`
 
+**Production (default)** — scanner on micro USB OTG:
+
+```bash
+cmake .. -DBOSON_USB_HID_HOST=ON
+```
+
+**VS Code USB serial debug** — micro USB to PC, no HID host (bench only):
+
+```bash
+cmake .. -DBOSON_USB_HID_HOST=OFF
+```
+
+After changing this option, delete the `build` folder or reconfigure so CMake picks up stdio settings.
+
 ### Wiring
 
 - Power/program: hold **BOOTSEL**, plug micro USB, flash UF2.
-- Runtime: micro USB **OTG host** → barcode scanner (HID).
-- Debug: connect UART to USB-serial adapter (default Pico UART pins).
+- Runtime (default build): micro USB **OTG host** → barcode scanner (HID).
+- **Logs (default build):** **UART0** on **GP0 (TX)** and **GND** @ **115200** to a USB–serial adapter (micro USB is host, not a PC COM port).
+- **Logs (`BOSON_USB_HID_HOST=OFF`):** Raspberry Pi Pico VS Code serial monitor on the Pico’s **USB COM port** @ **115200** (scanner host disabled).
 
 ### On-board LED (CYW43 WL)
 
