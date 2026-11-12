@@ -47,6 +47,7 @@ const unsigned long SERVER_CONNECT_TIMEOUT_MS = 5000;
 const unsigned long ACK_TIMEOUT_MS = 3000;
 const uint8_t MAX_SEND_RETRIES = 3;
 const unsigned long STATUS_PRINT_INTERVAL_MS = 10000;
+const unsigned long HEARTBEAT_INTERVAL_MS = 5000;
 
 // Ignore brief link / status glitches before clearing Wi-Fi (USB host + SDIO).
 const unsigned long WIFI_LINK_LOST_CONFIRM_MS = 4000;
@@ -82,6 +83,7 @@ static bool engineConnected = false;
 static unsigned long lastWiFiAttempt = 0;
 static unsigned long lastStatusPrint = 0;
 static unsigned long wifi_unstable_since_ms = 0;
+static unsigned long lastHeartbeatMs = 0;
 
 static uint32_t packetsSent = 0;
 static uint32_t packetsAcked = 0;
@@ -464,6 +466,7 @@ static bool dequeueBarcode(BarcodeMessage& message);
 static bool buildJsonPacket(const BarcodeMessage& message, char* out, size_t outLen);
 static bool sendBarcodeMessage(const BarcodeMessage& message);
 static bool waitForAck(uint32_t expectedSequence);
+static void sendEngineHeartbeatIfDue();
 
 static void printStatus();
 
@@ -582,6 +585,11 @@ static void loop()
   // readBarcodeSerial();
 
   ensureWiFi();
+
+  if (wifiConnected)
+  {
+    sendEngineHeartbeatIfDue();
+  }
 
   if (wifiConnected && queueCount > 0)
   {
@@ -1269,6 +1277,65 @@ static bool buildJsonPacket(const BarcodeMessage& message, char* out, size_t out
 // ============================================================
 // 14. SEND + ACK
 // ============================================================
+
+static void sendEngineHeartbeatIfDue()
+{
+  if (millis() - lastHeartbeatMs < HEARTBEAT_INTERVAL_MS)
+  {
+    return;
+  }
+
+  lastHeartbeatMs = millis();
+
+  if (!ensureEngine())
+  {
+    return;
+  }
+
+  char json[80];
+  snprintf(
+    json,
+    sizeof(json),
+    "{\"device_id\":\"%s\",\"heartbeat\":true}",
+    DEVICE_ID
+  );
+
+  size_t jsonLen = strlen(json);
+
+  cyw43_arch_lwip_begin();
+
+  err_t write_result = tcp_write(
+    engine_pcb,
+    json,
+    jsonLen,
+    TCP_WRITE_FLAG_COPY
+  );
+
+  if (write_result == ERR_OK)
+  {
+    write_result = tcp_write(
+      engine_pcb,
+      "\n",
+      1,
+      TCP_WRITE_FLAG_COPY
+    );
+  }
+
+  if (write_result == ERR_OK)
+  {
+    write_result = tcp_output(engine_pcb);
+  }
+
+  cyw43_arch_lwip_end();
+
+  if (write_result != ERR_OK)
+  {
+    closeEngineConnection();
+    return;
+  }
+
+  waitForAck(0);
+}
 
 static bool sendBarcodeMessage(const BarcodeMessage& message)
 {
